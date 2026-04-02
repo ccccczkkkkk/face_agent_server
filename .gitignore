@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+thinking.txt
+server_test.py
