@@ -65,7 +65,8 @@ def build_transcribe_session_update(transcription_language: str) -> dict:
     if transcription_language != "auto":
         instructions += (
             f" The expected spoken language is {source_label}. "
-            "Prefer that language when resolving ambiguous audio."
+            f" Transcribe in {source_label} only unless the audio is clearly in another language. "
+            "When audio is ambiguous, strongly prefer the expected language and script. "
         )
 
     return {

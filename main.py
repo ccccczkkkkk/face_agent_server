@@ -1,10 +1,10 @@
 from fastapi import FastAPI
 
 try:
-    from server import app as conversation_app
+    from server_conversation import app as conversation_app
     from server_subtitle import app as subtitle_app
 except ModuleNotFoundError:
-    from face_server.server import app as conversation_app
+    from face_server.server_conversation import app as conversation_app
     from face_server.server_subtitle import app as subtitle_app
 
 app = FastAPI(title="face_server")
