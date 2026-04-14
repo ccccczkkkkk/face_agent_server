@@ -12,8 +12,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import websockets
 
 try:
+    from local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
+    from text_translation import get_translation_text_model, request_text_translation
     from ws_utils import safe_receive_message, safe_send_envelope
 except ModuleNotFoundError:
+    from face_server.local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
+    from face_server.text_translation import get_translation_text_model, request_text_translation
     from face_server.ws_utils import safe_receive_message, safe_send_envelope
 
 load_dotenv()
@@ -21,6 +25,8 @@ load_dotenv()
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime")
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+STT_BACKEND = os.getenv("STT_BACKEND", "realtime").strip().lower()
+CONVERSATION_MEMORY_TRIGGER_CHARS = int(os.getenv("CONVERSATION_MEMORY_TRIGGER_CHARS", "80"))
 REALTIME_WS_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 DATA_DIR = Path(__file__).resolve().parent / "data" / "conversation_sessions"
 
@@ -28,9 +34,9 @@ app = FastAPI()
 
 TRANSCRIBE_TURN_DETECTION = {
     "type": "server_vad",
-    "threshold": 0.2,
-    "silence_duration_ms": 100,
-    "prefix_padding_ms": 300,
+    "threshold": 0.5,
+    "silence_duration_ms": 200,
+    "prefix_padding_ms": 400,
 }
 
 LANGUAGE_LABELS = {
@@ -232,24 +238,6 @@ def merge_session_state(session_state: dict, memory_patch: dict, user_message: d
     return merged
 
 
-def build_translation_prompt(
-    transcript: str,
-    transcription_language: str,
-    translation_language: str,
-) -> str:
-    source_label = language_label(transcription_language)
-    target_label = language_label(translation_language)
-    return (
-        f"Translate the sentence from {source_label} into concise natural "
-        f"{target_label}.\n"
-        "Return only the translation text.\n"
-        "Do not explain.\n"
-        "Do not use markdown.\n"
-        "Do not wrap the answer in JSON.\n\n"
-        f"Source:\n{transcript}"
-    )
-
-
 def build_transcribe_session_update(transcription_language: str) -> dict:
     instructions = "Conversation mode transcription only. Transcribe the spoken audio accurately."
     if transcription_language != "auto":
@@ -269,20 +257,6 @@ def build_transcribe_session_update(transcription_language: str) -> dict:
             "input_audio_transcription": {
                 "model": TRANSCRIBE_MODEL,
             },
-        },
-    }
-
-
-def build_translate_session_update(translation_language: str) -> dict:
-    target_label = language_label(translation_language)
-    return {
-        "type": "session.update",
-        "session": {
-            "modalities": ["text"],
-            "instructions": (
-                f"You translate conversation transcript lines into concise natural {target_label}. "
-                "Return plain text only."
-            ),
         },
     }
 
@@ -355,29 +329,6 @@ async def request_json_response(ows, instructions: str) -> dict:
     })
     final_text = await read_response_text(ows)
     return parse_json_object(final_text)
-
-
-async def request_translation(
-    ows,
-    transcript: str,
-    transcription_language: str,
-    translation_language: str,
-):
-    await send_ows_event(ows, {
-        "type": "response.create",
-        "response": {
-            "modalities": ["text"],
-            "instructions": build_translation_prompt(
-                transcript,
-                transcription_language,
-                translation_language,
-            ),
-        },
-    })
-
-
-async def read_translation_response(ows) -> str:
-    return await read_response_text(ows)
 
 
 async def derive_goal_from_outline(assistant_ows, outline: str) -> str:
@@ -508,6 +459,10 @@ def build_error_event(client_session_id: str, stage: str, message: str) -> dict:
     }
 
 
+def make_segment_id() -> str:
+    return f"seg_{uuid.uuid4().hex[:12]}"
+
+
 async def forward_audio_from_client(ws: WebSocket, ows):
     while True:
         msg = await safe_receive_message(ws)
@@ -531,24 +486,25 @@ async def forward_audio_from_client(ws: WebSocket, ows):
 
 async def translation_worker(
     ws: WebSocket,
-    translate_ows,
-    queue: asyncio.Queue[str],
+    queue: asyncio.Queue[tuple[str, str]],
     transcription_language: str,
     translation_language: str,
 ):
+    source_label = language_label(transcription_language)
+    target_label = language_label(translation_language)
+    print("Using text translation model:", get_translation_text_model(), f"for {source_label} -> {target_label}")
     while True:
-        transcript = await queue.get()
+        segment_id, transcript = await queue.get()
         try:
-            await request_translation(
-                translate_ows,
+            translation = await request_text_translation(
                 transcript,
-                transcription_language,
-                translation_language,
+                source_label,
+                target_label,
             )
-            translation = await read_translation_response(translate_ows)
             if translation:
                 sent = await safe_send_envelope(ws, {
                     "type": "translation",
+                    "segment_id": segment_id,
                     "transcript": transcript,
                     "translation": translation,
                 })
@@ -627,20 +583,33 @@ async def conversation_worker(
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    transcribe_ows = None
+    assistant_ows = None
+    transcriber = None
     try:
-        transcribe_ows = await openai_realtime_connect()
-        translate_ows = await openai_realtime_connect()
+        if STT_BACKEND == "realtime":
+            transcribe_ows = await openai_realtime_connect()
+        elif STT_BACKEND != "local_whisper":
+            print("Unsupported STT_BACKEND:", STT_BACKEND)
+            await ws.close()
+            return
         assistant_ows = await openai_realtime_connect()
     except Exception as exc:
         print("OpenAI realtime connect failed:", repr(exc))
         await ws.close()
         return
 
-    translation_queue: asyncio.Queue[str] = asyncio.Queue()
+    translation_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
     translation_task = None
-    conversation_task = None
-    pending_transcripts: list[str] = []
-    pending_lock = asyncio.Lock()
+    pending_memory_transcripts: list[str] = []
+    pending_memory_chars = 0
+    memory_lock = asyncio.Lock()
+    suggestion_lock = asyncio.Lock()
+    suggestion_task = None
+    last_assistant_reply: list[str] = []
+    flush_pending_memory = None
+    transcribe_closed = False
+    stt_error_sent = False
 
     try:
         try:
@@ -656,21 +625,19 @@ async def ws_endpoint(ws: WebSocket):
         transcription_language = str(body.get("transcription_language") or "auto").strip()
         translation_language = str(body.get("translation_language") or "zh-Hans").strip()
 
-        await send_ows_event(
-            transcribe_ows,
-            build_transcribe_session_update(transcription_language),
-        )
-        await send_ows_event(
-            translate_ows,
-            build_translate_session_update(translation_language),
-        )
+        if transcribe_ows is not None:
+            await send_ows_event(
+                transcribe_ows,
+                build_transcribe_session_update(transcription_language),
+            )
         await send_ows_event(
             assistant_ows,
             build_assistant_session_update(),
         )
 
         session_state = load_session_state(client_session_id)
-        if session_state is None:
+        is_new_session = session_state is None
+        if is_new_session:
             goal = await derive_goal_from_outline(assistant_ows, outline)
             session_state = build_initial_session_state(
                 client_session_id,
@@ -678,18 +645,18 @@ async def ws_endpoint(ws: WebSocket):
                 goal,
             )
             save_session_state(session_state)
+        last_assistant_reply = list(session_state.get("next_actions") or [])
 
         translation_task = asyncio.create_task(
             translation_worker(
                 ws,
-                translate_ows,
                 translation_queue,
                 transcription_language,
                 translation_language,
             )
         )
 
-        if outline:
+        if outline and is_new_session:
             try:
                 opening_suggestion = await generate_opening_suggestion(
                     assistant_ows,
@@ -707,8 +674,123 @@ async def ws_endpoint(ws: WebSocket):
                     build_error_event(client_session_id, "opening_suggestion", repr(exc)),
                 )
 
+        async def flush_pending_memory(force: bool = False) -> bool:
+            nonlocal pending_memory_chars
+            async with memory_lock:
+                if not pending_memory_transcripts:
+                    return False
+                if not force and pending_memory_chars < CONVERSATION_MEMORY_TRIGGER_CHARS:
+                    return False
+
+                batch = list(pending_memory_transcripts)
+                pending_memory_transcripts.clear()
+                pending_memory_chars = 0
+
+            user_message = build_user_message(client_session_id, batch)
+            append_event(client_session_id, user_message)
+
+            try:
+                memory_patch = await extract_memory_patch(
+                    assistant_ows,
+                    session_state,
+                    user_message,
+                    last_assistant_reply,
+                )
+                append_event(
+                    client_session_id,
+                    build_memory_patch_event(client_session_id, memory_patch),
+                )
+
+                merged_state = merge_session_state(session_state, memory_patch, user_message)
+                if outline and not merged_state.get("goal"):
+                    merged_state["goal"] = build_default_goal(outline)
+                save_session_state(merged_state)
+                session_state.clear()
+                session_state.update(merged_state)
+                return True
+            except Exception as exc:
+                append_event(
+                    client_session_id,
+                    build_error_event(client_session_id, "memory_flush", repr(exc)),
+                )
+                return False
+
+        async def generate_manual_suggestion():
+            nonlocal last_assistant_reply
+            async with suggestion_lock:
+                async with memory_lock:
+                    pending_batch = list(pending_memory_transcripts)
+                    pending_chars = pending_memory_chars
+
+                if pending_batch and pending_chars >= CONVERSATION_MEMORY_TRIGGER_CHARS:
+                    await flush_pending_memory(force=True)
+                    pending_batch = []
+
+                if pending_batch:
+                    base_text = str(session_state.get("last_user_message") or "").strip()
+                    extra_text = "\n".join(item.strip() for item in pending_batch if item.strip()).strip()
+                    merged_text = "\n".join(item for item in [base_text, extra_text] if item).strip()
+                    user_message = {
+                        "session_id": client_session_id,
+                        "message_id": f"m_{uuid.uuid4().hex[:12]}",
+                        "role": "unknown",
+                        "text": merged_text,
+                        "timestamp": now_iso(),
+                    }
+                else:
+                    user_message = build_user_message(
+                        client_session_id,
+                        [str(session_state.get("last_user_message") or "").strip()],
+                    )
+
+                try:
+                    workflow_result = build_workflow_result(session_state, user_message)
+                    suggestion = await generate_assistant_reply(
+                        assistant_ows,
+                        session_state,
+                        user_message,
+                        workflow_result,
+                    )
+                    append_event(
+                        client_session_id,
+                        build_assistant_reply_event(client_session_id, suggestion),
+                    )
+                    last_assistant_reply = [
+                        str(item.get("ja") or "").strip()
+                        for item in (suggestion.get("next_say") or [])
+                        if isinstance(item, dict) and str(item.get("ja") or "").strip()
+                    ]
+                    await safe_send_envelope(ws, suggestion)
+                except Exception as exc:
+                    append_event(
+                        client_session_id,
+                        build_error_event(client_session_id, "manual_suggestion", repr(exc)),
+                    )
+
+        async def handle_transcript_final(transcript: str):
+            nonlocal pending_memory_chars
+            transcript = transcript.strip()
+            segment_id = make_segment_id()
+
+            sent = await safe_send_envelope(ws, {
+                "type": "transcript_final",
+                "segment_id": segment_id,
+                "transcript": transcript,
+                "translation": "",
+                "next_say": [],
+                "intent": "",
+            })
+            if not sent:
+                return
+
+            if transcript:
+                await translation_queue.put((segment_id, transcript))
+                async with memory_lock:
+                    pending_memory_transcripts.append(transcript)
+                    pending_memory_chars += len(transcript)
+                await flush_pending_memory(force=False)
+
         async def relay_events_to_client():
-            nonlocal conversation_task
             current_transcript = ""
 
             async for raw in transcribe_ows:
@@ -740,53 +822,103 @@ async def ws_endpoint(ws: WebSocket):
                 if event_type == "conversation.item.input_audio_transcription.completed":
                     transcript = (event.get("transcript") or current_transcript).strip()
                     current_transcript = ""
+                    await handle_transcript_final(transcript)
 
-                    sent = await safe_send_envelope(ws, {
-                        "type": "transcript_final",
-                        "transcript": transcript,
-                        "translation": "",
-                        "next_say": [],
-                        "intent": "",
-                    })
-                    if not sent:
-                        return
+        async def handle_local_delta(delta: str):
+            await safe_send_envelope(ws, {
+                "type": "transcript_delta",
+                "delta": delta,
+            })
 
-                    if transcript:
-                        await translation_queue.put(transcript)
-                        async with pending_lock:
-                            pending_transcripts.append(transcript)
-                        if conversation_task is None or conversation_task.done():
-                            conversation_task = asyncio.create_task(
-                                conversation_worker(
-                                    ws,
-                                    assistant_ows,
-                                    client_session_id,
-                                    outline,
-                                    session_state,
-                                    pending_transcripts,
-                                    pending_lock,
-                                )
-                            )
+        async def notify_stt_connection_closed(reason: str):
+            nonlocal transcribe_closed, stt_error_sent
+            transcribe_closed = True
+            if stt_error_sent:
+                return
+            stt_error_sent = True
+            await safe_send_envelope(ws, {
+                "type": "error",
+                "stage": "stt_connection",
+                "message": "transcribe websocket closed",
+                "reason": reason,
+            })
 
-        await asyncio.gather(
-            forward_audio_from_client(ws, transcribe_ows),
-            relay_events_to_client(),
-        )
+        async def handle_client_messages():
+            nonlocal suggestion_task
+            while True:
+                msg = await safe_receive_message(ws)
+                if msg is None:
+                    return
+                if "bytes" in msg and msg["bytes"] is not None:
+                    if transcribe_ows is not None and not transcribe_closed:
+                        payload = {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(msg["bytes"]).decode("utf-8"),
+                        }
+                        try:
+                            await transcribe_ows.send(json.dumps(payload))
+                        except websockets.exceptions.ConnectionClosed as exc:
+                            await notify_stt_connection_closed(repr(exc))
+                    elif transcriber is not None:
+                        await transcriber.add_audio(msg["bytes"])
+                    continue
+
+                if "text" not in msg or msg["text"] is None:
+                    continue
+
+                try:
+                    body = json.loads(msg["text"])
+                except Exception:
+                    continue
+
+                body_type = body.get("type")
+                if body_type == "reset":
+                    if transcribe_ows is not None and not transcribe_closed:
+                        try:
+                            await transcribe_ows.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                        except websockets.exceptions.ConnectionClosed as exc:
+                            await notify_stt_connection_closed(repr(exc))
+                    elif transcriber is not None:
+                        await transcriber.reset()
+                    continue
+
+                if body_type == "request_suggestion":
+                    if suggestion_task is None or suggestion_task.done():
+                        suggestion_task = asyncio.create_task(generate_manual_suggestion())
+
+        if STT_BACKEND == "realtime":
+            await asyncio.gather(
+                handle_client_messages(),
+                relay_events_to_client(),
+            )
+        else:
+            transcriber = LocalWhisperStream(
+                transcription_language,
+                handle_local_delta,
+                handle_transcript_final,
+            )
+
+            try:
+                await asyncio.gather(
+                    handle_client_messages(),
+                    transcriber.run(),
+                )
+            finally:
+                await transcriber.close()
     except WebSocketDisconnect:
         pass
     finally:
-        if conversation_task is not None:
-            await asyncio.gather(conversation_task, return_exceptions=True)
+        if suggestion_task is not None:
+            await asyncio.gather(suggestion_task, return_exceptions=True)
+        if flush_pending_memory is not None:
+            await flush_pending_memory(force=True)
         if translation_task is not None:
             await translation_queue.join()
             translation_task.cancel()
             await asyncio.gather(translation_task, return_exceptions=True)
         try:
-            await transcribe_ows.close()
-        except Exception:
-            pass
-        try:
-            await translate_ows.close()
+            if transcribe_ows is not None:
+                await transcribe_ows.close()
         except Exception:
             pass
         try:
