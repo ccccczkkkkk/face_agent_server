@@ -10,11 +10,25 @@ import websockets
 
 try:
     from local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
-    from text_translation import get_translation_text_model, request_text_translation
+    from text_translation import (
+        get_correction_text_model,
+        get_summary_text_model,
+        get_translation_text_model,
+        request_chunk_correction,
+        request_text_summary,
+        request_text_translation,
+    )
     from ws_utils import safe_receive_message, safe_send_envelope
 except ModuleNotFoundError:
     from face_server.local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
-    from face_server.text_translation import get_translation_text_model, request_text_translation
+    from face_server.text_translation import (
+        get_correction_text_model,
+        get_summary_text_model,
+        get_translation_text_model,
+        request_chunk_correction,
+        request_text_summary,
+        request_text_translation,
+    )
     from face_server.ws_utils import safe_receive_message, safe_send_envelope
 
 load_dotenv()
@@ -23,6 +37,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime")
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
 STT_BACKEND = os.getenv("STT_BACKEND", "realtime").strip().lower()
+SUBTITLE_SUMMARY_TRIGGER_CHARS = int(os.getenv("SUBTITLE_SUMMARY_TRIGGER_CHARS", "120"))
 REALTIME_WS_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
 app = FastAPI()
@@ -63,6 +78,26 @@ async def openai_realtime_connect():
 
 def language_label(code: str) -> str:
     return LANGUAGE_LABELS.get(code, code)
+
+
+def summary_source_label(transcription_language: str) -> str:
+    if transcription_language == "auto":
+        return "the source language of the summary"
+    return language_label(transcription_language)
+
+
+def correction_source_label(transcription_language: str) -> str:
+    if transcription_language == "auto":
+        return "the same language as the transcript chunk"
+    return language_label(transcription_language)
+
+
+def is_english_source(transcription_language: str) -> bool:
+    return transcription_language == "en"
+
+
+def is_simplified_chinese_source(transcription_language: str) -> bool:
+    return transcription_language in {"zh", "zh-Hans"}
 
 
 def build_transcribe_session_update(transcription_language: str) -> dict:
@@ -144,8 +179,66 @@ async def subtitle_translation_worker(
             queue.task_done()
 
 
+async def subtitle_summary_worker(
+    ws: WebSocket,
+    queue: asyncio.Queue[tuple[str, list[str]]],
+    transcription_language: str,
+):
+    print("Using subtitle summary model:", get_summary_text_model())
+    print("Using subtitle correction model:", get_correction_text_model())
+    source_label = summary_source_label(transcription_language)
+    correction_label = correction_source_label(transcription_language)
+    while True:
+        summary_id, transcripts = await queue.get()
+        try:
+            chunk_text = "\n".join(item.strip() for item in transcripts if item.strip()).strip()
+            if not chunk_text:
+                continue
+            note_source = (await request_chunk_correction(chunk_text, correction_label)).strip() or chunk_text
+            source_summary = (await request_text_summary(note_source)).strip()
+            if not source_summary:
+                continue
+            english_task = None
+            chinese_task = None
+            english_summary = source_summary if is_english_source(transcription_language) else ""
+            chinese_summary = source_summary if is_simplified_chinese_source(transcription_language) else ""
+
+            if not english_summary:
+                english_task = asyncio.create_task(
+                    request_text_translation(source_summary, source_label, "English")
+                )
+            if not chinese_summary:
+                chinese_task = asyncio.create_task(
+                    request_text_translation(source_summary, source_label, "Simplified Chinese")
+                )
+
+            if english_task is not None:
+                english_summary = (await english_task).strip()
+            if chinese_task is not None:
+                chinese_summary = (await chinese_task).strip()
+            summaries = {
+                "source": source_summary,
+                "en": english_summary.strip(),
+                "zh-Hans": chinese_summary.strip(),
+            }
+            if summaries.get("source") or summaries.get("en") or summaries.get("zh-Hans"):
+                sent = await safe_send_envelope(ws, {
+                    "type": "summary",
+                    "summary_id": summary_id,
+                    "summary_type": "chunk",
+                    "note_source": note_source,
+                    "summary": summaries.get("source") or summaries.get("zh-Hans") or summaries.get("en") or "",
+                    "summaries": summaries,
+                })
+                if not sent:
+                    return
+        finally:
+            queue.task_done()
+
+
 async def relay_subtitle_events_to_client(ws: WebSocket, transcribe_ows,
-                                          translation_queue: asyncio.Queue[tuple[str, str]]):
+                                          translation_queue: asyncio.Queue[tuple[str, str]],
+                                          on_final_transcript):
     current_transcript = ""
 
     async for raw in transcribe_ows:
@@ -186,6 +279,7 @@ async def relay_subtitle_events_to_client(ws: WebSocket, transcribe_ows,
 
             if transcript:
                 await translation_queue.put((segment_id, transcript))
+                await on_final_transcript(transcript)
 
 
 @app.websocket("/ws")
@@ -206,9 +300,14 @@ async def ws_endpoint(ws: WebSocket):
         return
 
     translation_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+    summary_queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue()
     translation_task = None
+    summary_task = None
     transcribe_closed = False
     stt_error_sent = False
+    pending_summary_transcripts: list[str] = []
+    pending_summary_chars = 0
+    summary_lock = asyncio.Lock()
 
     try:
         try:
@@ -232,19 +331,33 @@ async def ws_endpoint(ws: WebSocket):
                 build_transcribe_session_update(transcription_language),
             )
 
-        translation_task = asyncio.create_task(
-            subtitle_translation_worker(
-                ws,
-                translation_queue,
-                transcription_language,
-                translation_language,
-            )
-        )
+        async def flush_pending_summary(force: bool = False):
+            nonlocal pending_summary_chars
+            async with summary_lock:
+                if not pending_summary_transcripts:
+                    return
+                if not force and pending_summary_chars < SUBTITLE_SUMMARY_TRIGGER_CHARS:
+                    return
+                summary_id = f"sum_{uuid.uuid4().hex[:12]}"
+                batch = list(pending_summary_transcripts)
+                pending_summary_transcripts.clear()
+                pending_summary_chars = 0
+            await summary_queue.put((summary_id, batch))
+
         async def handle_local_delta(delta: str):
             await safe_send_envelope(ws, {
                 "type": "transcript_delta",
                 "delta": delta,
             })
+
+        async def handle_summary_transcript(transcript: str):
+            nonlocal pending_summary_chars
+            if not transcript:
+                return
+            async with summary_lock:
+                pending_summary_transcripts.append(transcript)
+                pending_summary_chars += len(transcript)
+            await flush_pending_summary(force=False)
 
         async def handle_local_final(transcript: str):
             transcript = transcript.strip()
@@ -262,6 +375,22 @@ async def ws_endpoint(ws: WebSocket):
 
             if transcript:
                 await translation_queue.put((segment_id, transcript))
+                await handle_summary_transcript(transcript)
+        translation_task = asyncio.create_task(
+            subtitle_translation_worker(
+                ws,
+                translation_queue,
+                transcription_language,
+                translation_language,
+            )
+        )
+        summary_task = asyncio.create_task(
+            subtitle_summary_worker(
+                ws,
+                summary_queue,
+                transcription_language,
+            )
+        )
 
         async def notify_stt_connection_closed(reason: str):
             nonlocal transcribe_closed, stt_error_sent
@@ -315,7 +444,12 @@ async def ws_endpoint(ws: WebSocket):
         if STT_BACKEND == "realtime":
             await asyncio.gather(
                 handle_client_messages(),
-                relay_subtitle_events_to_client(ws, transcribe_ows, translation_queue),
+                relay_subtitle_events_to_client(
+                    ws,
+                    transcribe_ows,
+                    translation_queue,
+                    handle_summary_transcript,
+                ),
             )
         else:
             transcriber = LocalWhisperStream(
@@ -325,6 +459,7 @@ async def ws_endpoint(ws: WebSocket):
             )
 
             try:
+                await transcriber.start()
                 await asyncio.gather(
                     handle_client_messages(),
                     transcriber.run(),
@@ -334,6 +469,12 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        if "flush_pending_summary" in locals():
+            await flush_pending_summary(force=True)
+        if summary_task is not None:
+            await summary_queue.join()
+            summary_task.cancel()
+            await asyncio.gather(summary_task, return_exceptions=True)
         if translation_task is not None:
             await translation_queue.join()
             translation_task.cancel()

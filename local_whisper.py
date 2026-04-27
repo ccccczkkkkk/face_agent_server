@@ -1,7 +1,7 @@
 import asyncio
+import gc
 import inspect
 import os
-from functools import lru_cache
 from typing import Awaitable, Callable
 
 try:
@@ -11,8 +11,14 @@ except ModuleNotFoundError:
 
 
 WHISPER_TARGET_SAMPLE_RATE = 16000
+WHISPER_IDLE_UNLOAD_SECONDS = 60.0
 
 TranscriptCallback = Callable[[str], Awaitable[None] | None]
+
+_WHISPER_MODEL = None
+_WHISPER_ACTIVE_STREAMS = 0
+_WHISPER_MODEL_LOCK = asyncio.Lock()
+_WHISPER_UNLOAD_TASK: asyncio.Task | None = None
 
 
 def whisper_language_code(language: str | None) -> str | None:
@@ -40,8 +46,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-@lru_cache(maxsize=1)
-def get_whisper_model():
+def _build_whisper_model():
     from faster_whisper import WhisperModel
 
     model_size = os.getenv("WHISPER_MODEL_SIZE", "medium")
@@ -54,6 +59,58 @@ def get_whisper_model():
         f"compute_type={compute_type}",
     )
     return WhisperModel(model_size, device=device, compute_type=compute_type)
+
+
+def _get_loaded_whisper_model():
+    if _WHISPER_MODEL is None:
+        raise RuntimeError("Whisper model is not loaded")
+    return _WHISPER_MODEL
+
+
+async def acquire_whisper_model():
+    global _WHISPER_MODEL, _WHISPER_ACTIVE_STREAMS, _WHISPER_UNLOAD_TASK
+    async with _WHISPER_MODEL_LOCK:
+        _WHISPER_ACTIVE_STREAMS += 1
+        if _WHISPER_UNLOAD_TASK is not None:
+            _WHISPER_UNLOAD_TASK.cancel()
+            _WHISPER_UNLOAD_TASK = None
+        if _WHISPER_MODEL is None:
+            _WHISPER_MODEL = await asyncio.to_thread(_build_whisper_model)
+        return _WHISPER_MODEL
+
+
+async def release_whisper_model():
+    global _WHISPER_ACTIVE_STREAMS, _WHISPER_UNLOAD_TASK
+    async with _WHISPER_MODEL_LOCK:
+        if _WHISPER_ACTIVE_STREAMS > 0:
+            _WHISPER_ACTIVE_STREAMS -= 1
+        if _WHISPER_ACTIVE_STREAMS == 0 and _WHISPER_UNLOAD_TASK is None:
+            _WHISPER_UNLOAD_TASK = asyncio.create_task(_delayed_unload_whisper_model())
+
+
+async def _delayed_unload_whisper_model():
+    global _WHISPER_MODEL, _WHISPER_UNLOAD_TASK
+    try:
+        await asyncio.sleep(_env_float("WHISPER_IDLE_UNLOAD_SECONDS", WHISPER_IDLE_UNLOAD_SECONDS))
+        async with _WHISPER_MODEL_LOCK:
+            if _WHISPER_ACTIVE_STREAMS != 0 or _WHISPER_MODEL is None:
+                return
+            print("Unloading faster-whisper model after idle timeout")
+            _WHISPER_MODEL = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        pass
+    finally:
+        async with _WHISPER_MODEL_LOCK:
+            if _WHISPER_ACTIVE_STREAMS == 0:
+                _WHISPER_UNLOAD_TASK = None
 
 
 def pcm16_rms(pcm_bytes: bytes) -> float:
@@ -106,6 +163,13 @@ class LocalWhisperStream:
         self._silence_ms = 0.0
         self._has_voice = False
         self._closed = False
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        await acquire_whisper_model()
+        self._started = True
 
     async def add_audio(self, chunk: bytes) -> None:
         if self._closed or not chunk:
@@ -142,6 +206,9 @@ class LocalWhisperStream:
             has_voice = self._has_voice and bool(self._buffer)
         if has_voice:
             await self._emit_final()
+        if self._started:
+            self._started = False
+            await release_whisper_model()
 
     async def run(self) -> None:
         while not self._closed:
@@ -198,7 +265,7 @@ class LocalWhisperStream:
         return await asyncio.to_thread(self._transcribe_sync, audio)
 
     def _transcribe_sync(self, audio) -> str:
-        segments, _ = get_whisper_model().transcribe(
+        segments, _ = _get_loaded_whisper_model().transcribe(
             audio,
             language=self.transcription_language,
             vad_filter=False,

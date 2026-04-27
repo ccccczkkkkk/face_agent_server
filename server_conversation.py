@@ -899,6 +899,7 @@ async def ws_endpoint(ws: WebSocket):
             )
 
             try:
+                await transcriber.start()
                 await asyncio.gather(
                     handle_client_messages(),
                     transcriber.run(),
