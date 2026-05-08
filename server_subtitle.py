@@ -10,6 +10,7 @@ import websockets
 
 try:
     from local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
+    from soniox_stt import SonioxRealtimeStream, soniox_target_language
     from text_translation import (
         get_correction_text_model,
         get_summary_text_model,
@@ -21,6 +22,7 @@ try:
     from ws_utils import safe_receive_message, safe_send_envelope
 except ModuleNotFoundError:
     from face_server.local_whisper import LocalWhisperStream, forward_audio_from_client_to_whisper
+    from face_server.soniox_stt import SonioxRealtimeStream, soniox_target_language
     from face_server.text_translation import (
         get_correction_text_model,
         get_summary_text_model,
@@ -179,6 +181,41 @@ async def subtitle_translation_worker(
             queue.task_done()
 
 
+async def send_transcript_and_translation(
+    ws: WebSocket,
+    transcript: str,
+    on_final_transcript,
+    translation_queue: asyncio.Queue[tuple[str, str]] | None = None,
+    direct_translation: str = "",
+):
+    transcript = transcript.strip()
+    segment_id = f"seg_{uuid.uuid4().hex[:12]}"
+    sent = await safe_send_envelope(ws, {
+        "type": "transcript_final",
+        "segment_id": segment_id,
+        "transcript": transcript,
+        "translation": "",
+        "next_say": [],
+        "intent": "",
+    })
+    if not sent or not transcript:
+        return
+
+    if direct_translation.strip():
+        sent = await safe_send_envelope(ws, {
+            "type": "translation",
+            "segment_id": segment_id,
+            "transcript": transcript,
+            "translation": direct_translation.strip(),
+        })
+        if not sent:
+            return
+    elif translation_queue is not None:
+        await translation_queue.put((segment_id, transcript))
+
+    await on_final_transcript(transcript)
+
+
 async def subtitle_summary_worker(
     ws: WebSocket,
     queue: asyncio.Queue[tuple[str, list[str]]],
@@ -264,22 +301,12 @@ async def relay_subtitle_events_to_client(ws: WebSocket, transcribe_ows,
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or current_transcript).strip()
             current_transcript = ""
-            segment_id = f"seg_{uuid.uuid4().hex[:12]}"
-
-            sent = await safe_send_envelope(ws, {
-                "type": "transcript_final",
-                "segment_id": segment_id,
-                "transcript": transcript,
-                "translation": "",
-                "next_say": [],
-                "intent": "",
-            })
-            if not sent:
-                return
-
-            if transcript:
-                await translation_queue.put((segment_id, transcript))
-                await on_final_transcript(transcript)
+            await send_transcript_and_translation(
+                ws,
+                transcript,
+                on_final_transcript,
+                translation_queue=translation_queue,
+            )
 
 
 @app.websocket("/ws")
@@ -290,7 +317,7 @@ async def ws_endpoint(ws: WebSocket):
     try:
         if STT_BACKEND == "realtime":
             transcribe_ows = await openai_realtime_connect()
-        elif STT_BACKEND != "local_whisper":
+        elif STT_BACKEND not in {"local_whisper", "soniox"}:
             print("Unsupported STT_BACKEND:", STT_BACKEND)
             await ws.close()
             return
@@ -324,6 +351,13 @@ async def ws_endpoint(ws: WebSocket):
         translation_language = str(
             body.get("translation_language") or "zh-Hans"
         ).strip()
+        source_language_code = soniox_target_language(transcription_language)
+        target_language_code = soniox_target_language(translation_language)
+        use_soniox_direct_translation = (
+            STT_BACKEND == "soniox"
+            and target_language_code is not None
+            and (source_language_code is None or target_language_code != source_language_code)
+        )
 
         if transcribe_ows is not None:
             await send_ows_event(
@@ -360,30 +394,31 @@ async def ws_endpoint(ws: WebSocket):
             await flush_pending_summary(force=False)
 
         async def handle_local_final(transcript: str):
-            transcript = transcript.strip()
-            segment_id = f"seg_{uuid.uuid4().hex[:12]}"
-            sent = await safe_send_envelope(ws, {
-                "type": "transcript_final",
-                "segment_id": segment_id,
-                "transcript": transcript,
-                "translation": "",
-                "next_say": [],
-                "intent": "",
-            })
-            if not sent:
-                return
-
-            if transcript:
-                await translation_queue.put((segment_id, transcript))
-                await handle_summary_transcript(transcript)
-        translation_task = asyncio.create_task(
-            subtitle_translation_worker(
+            await send_transcript_and_translation(
                 ws,
-                translation_queue,
-                transcription_language,
-                translation_language,
+                transcript,
+                handle_summary_transcript,
+                translation_queue=translation_queue,
             )
-        )
+
+        async def handle_soniox_final(transcript: str, translation: str):
+            await send_transcript_and_translation(
+                ws,
+                transcript,
+                handle_summary_transcript,
+                translation_queue=None if use_soniox_direct_translation else translation_queue,
+                direct_translation=translation if use_soniox_direct_translation else "",
+            )
+
+        if not use_soniox_direct_translation:
+            translation_task = asyncio.create_task(
+                subtitle_translation_worker(
+                    ws,
+                    translation_queue,
+                    transcription_language,
+                    translation_language,
+                )
+            )
         summary_task = asyncio.create_task(
             subtitle_summary_worker(
                 ws,
@@ -451,11 +486,27 @@ async def ws_endpoint(ws: WebSocket):
                     handle_summary_transcript,
                 ),
             )
-        else:
+        elif STT_BACKEND == "local_whisper":
             transcriber = LocalWhisperStream(
                 transcription_language,
                 handle_local_delta,
                 handle_local_final,
+            )
+
+            try:
+                await transcriber.start()
+                await asyncio.gather(
+                    handle_client_messages(),
+                    transcriber.run(),
+                )
+            finally:
+                await transcriber.close()
+        else:
+            transcriber = SonioxRealtimeStream(
+                transcription_language,
+                handle_local_delta,
+                handle_soniox_final,
+                translation_language=translation_language,
             )
 
             try:

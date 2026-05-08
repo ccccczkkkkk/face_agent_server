@@ -2,20 +2,24 @@
 
 ## Overview
 
-This server update includes four main areas:
+This server update includes six main areas:
 
 1. Optional local Whisper STT backend
-2. Text-model translation path
+2. Optional Soniox realtime STT backend
+3. Text-model translation path
 3. Protocol updates for transcript/translation alignment
 4. Manual conversation suggestion flow
+5. Subtitle chunk summary and note output
+6. Soniox direct translation path
 
 ## 1. STT Backend
 
-The server now supports two STT backends:
+The server now supports three STT backends:
 
 ```env
 STT_BACKEND=realtime
 STT_BACKEND=local_whisper
+STT_BACKEND=soniox
 ```
 
 Default behavior remains:
@@ -24,14 +28,27 @@ Default behavior remains:
 STT_BACKEND=realtime
 ```
 
-New module:
+New modules:
 
 - `local_whisper.py`
+- `soniox_stt.py`
 
 Both routes support the new backend:
 
 - `/conversation/ws`
 - `/subtitle/ws`
+
+### Soniox Notes
+
+`soniox` is intended for cloud-friendly realtime STT without self-hosted GPU requirements.
+
+Current behavior:
+
+- `subtitle` supports Soniox realtime transcription
+- `conversation` supports Soniox realtime transcription
+- language hints are applied when `transcription_language` is explicitly set
+- optional direct translation is available from Soniox in supported target languages
+- forced segmentation is supported through a character threshold
 
 ## 2. Translation Path
 
@@ -46,6 +63,11 @@ Default translation model:
 ```env
 TRANSLATION_TEXT_MODEL=gpt-4.1-mini
 ```
+
+This text-model path is still used:
+
+- for non-Soniox STT backends
+- as a fallback when Soniox direct translation is not available for the requested target language
 
 ## 3. Protocol Updates
 
@@ -88,6 +110,61 @@ Recommended client behavior:
 
 1. On `transcript_final`, create a transcript row keyed by `segment_id`
 2. On `translation`, fill the matching row by `segment_id`
+
+### Added `summary_id`
+
+`subtitle` chunk summaries now include `summary_id`.
+
+This allows the client to append or manage summary blocks reliably.
+
+`summary`
+
+```json
+{
+  "type": "summary",
+  "summary_id": "sum_xxx",
+  "summary_type": "chunk",
+  "note_source": "Corrected chunk transcript used for notes",
+  "summary": "Source-language summary text",
+  "summaries": {
+    "source": "Source-language summary text",
+    "en": "English summary text",
+    "zh-Hans": "Simplified Chinese summary text"
+  }
+}
+```
+
+Recommended client behavior:
+
+1. Use `summary_id` as the key for each summary block
+2. Use `note_source` as the corrected full note text for that chunk
+3. Use `summaries.source` / `summaries.en` / `summaries.zh-Hans` for language-specific display
+4. Append each chunk summary or note block in order if building a running notes panel
+
+### Soniox Direct Translation
+
+When `STT_BACKEND=soniox` and the requested `translation_language` is supported, both `subtitle` and `conversation` can use Soniox final translation directly instead of the OpenAI text translation worker.
+
+Current mapped target languages:
+
+- `ja`
+- `en`
+- `zh`
+- `zh-Hans`
+- `ko`
+
+Protocol remains unchanged:
+
+```json
+{
+  "type": "translation",
+  "segment_id": "seg_xxx",
+  "transcript": "Source transcript text",
+  "translation": "Translated text"
+}
+```
+
+If the target language is unsupported or is the same as the explicit source language, the server falls back to the existing OpenAI text translation path.
 
 ## 4. Conversation Suggestion Flow
 
@@ -168,6 +245,19 @@ Recommended client behavior after receiving this event:
 STT_BACKEND=realtime
 TRANSLATION_TEXT_MODEL=gpt-4.1-mini
 CONVERSATION_MEMORY_TRIGGER_CHARS=80
+SUBTITLE_SUMMARY_MODEL=gpt-4.1-mini
+SUBTITLE_CORRECTION_MODEL=gpt-4.1-mini
+SUBTITLE_SUMMARY_TRIGGER_CHARS=120
+SONIOX_API_KEY=
+SONIOX_MODEL=stt-rt-v4
+SONIOX_AUDIO_FORMAT=pcm_s16le
+SONIOX_SAMPLE_RATE=24000
+SONIOX_NUM_CHANNELS=1
+SONIOX_ENABLE_ENDPOINT_DETECTION=true
+SONIOX_MAX_ENDPOINT_DELAY_MS=1200
+SONIOX_KEEPALIVE_INTERVAL_MS=8000
+SONIOX_TRAILING_SILENCE_MS=300
+SONIOX_FORCE_FINALIZE_AFTER_CHARS=120
 WHISPER_MODEL_SIZE=medium
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
@@ -177,8 +267,9 @@ WHISPER_OVERLAP_SECONDS=1.0
 WHISPER_FINAL_SILENCE_MS=700
 WHISPER_SILENCE_THRESHOLD=0.01
 WHISPER_SAMPLE_RATE=24000
+WHISPER_IDLE_UNLOAD_SECONDS=60
 ```
 
 ## 7. Current Remote Commit
 
-- `9d8c690 Add local whisper STT and manual conversation suggestions`
+- `a3e12d5 Improve subtitle notes and whisper lifecycle`
