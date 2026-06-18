@@ -46,6 +46,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _debug_audio_enabled() -> bool:
+    return os.getenv("WHISPER_DEBUG_AUDIO", "false").strip().lower() == "true"
+
+
 def _build_whisper_model():
     from faster_whisper import WhisperModel
 
@@ -170,6 +174,15 @@ class LocalWhisperStream:
             return
         await acquire_whisper_model()
         self._started = True
+        if _debug_audio_enabled():
+            print(
+                "LocalWhisperStream started:",
+                f"language={self.transcription_language or 'auto'}",
+                f"sample_rate={self.sample_rate}",
+                f"window_seconds={self.window_seconds}",
+                f"step_seconds={self.step_seconds}",
+                f"silence_threshold={self.silence_threshold}",
+            )
 
     async def add_audio(self, chunk: bytes) -> None:
         if self._closed or not chunk:
@@ -186,6 +199,16 @@ class LocalWhisperStream:
             else:
                 self._silence_ms = 0.0
                 self._has_voice = True
+
+            if _debug_audio_enabled():
+                print(
+                    "LocalWhisperStream audio:",
+                    f"bytes={len(chunk)}",
+                    f"rms={rms:.5f}",
+                    f"buffer_bytes={len(self._buffer)}",
+                    f"silence_ms={self._silence_ms:.0f}",
+                    f"has_voice={self._has_voice}",
+                )
 
             if self._has_voice and self._silence_ms >= self.final_silence_ms:
                 should_finalize = True
@@ -211,26 +234,37 @@ class LocalWhisperStream:
             await release_whisper_model()
 
     async def run(self) -> None:
-        while not self._closed:
-            await asyncio.sleep(self.step_seconds)
-            audio = await self._recent_audio()
-            if not audio:
-                continue
+        try:
+            while not self._closed:
+                await asyncio.sleep(self.step_seconds)
+                audio = await self._recent_audio()
+                if not audio:
+                    continue
 
-            partial_text = await self._transcribe(audio)
-            if not partial_text:
-                continue
+                partial_text = await self._transcribe(audio)
+                if not partial_text:
+                    continue
 
-            async with self._lock:
-                previous = self._last_partial
-                if partial_text.startswith(previous):
-                    delta = partial_text[len(previous):]
-                    self._last_partial = partial_text
-                else:
-                    delta = ""
+                async with self._lock:
+                    previous = self._last_partial
+                    if partial_text.startswith(previous):
+                        delta = partial_text[len(previous):]
+                        self._last_partial = partial_text
+                    else:
+                        delta = ""
 
-            if delta:
-                await self._call(self.on_delta, delta)
+                if _debug_audio_enabled():
+                    print(
+                        "LocalWhisperStream partial:",
+                        f"text={partial_text!r}",
+                        f"delta={delta!r}",
+                    )
+
+                if delta:
+                    await self._call(self.on_delta, delta)
+        except Exception as exc:
+            print("LocalWhisperStream run failed:", repr(exc))
+            raise
 
     async def _recent_audio(self) -> bytes:
         bytes_per_second = self.sample_rate * 2
@@ -254,6 +288,8 @@ class LocalWhisperStream:
                 return
 
             final_text = await self._transcribe(audio)
+            if _debug_audio_enabled():
+                print("LocalWhisperStream final:", repr(final_text))
             if final_text:
                 await self._call(self.on_final, final_text)
 

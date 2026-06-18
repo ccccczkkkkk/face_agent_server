@@ -21,6 +21,7 @@ SONIOX_MAX_ENDPOINT_DELAY_MS = int(os.getenv("SONIOX_MAX_ENDPOINT_DELAY_MS", "12
 SONIOX_KEEPALIVE_INTERVAL_MS = int(os.getenv("SONIOX_KEEPALIVE_INTERVAL_MS", "8000"))
 SONIOX_TRAILING_SILENCE_MS = int(os.getenv("SONIOX_TRAILING_SILENCE_MS", "300"))
 SONIOX_FORCE_FINALIZE_AFTER_CHARS = int(os.getenv("SONIOX_FORCE_FINALIZE_AFTER_CHARS", "120"))
+SONIOX_IDLE_CLOSE_SECONDS = float(os.getenv("SONIOX_IDLE_CLOSE_SECONDS", "60"))
 
 _LANGUAGE_HINTS = {
     "ja": "ja",
@@ -54,19 +55,26 @@ class SonioxRealtimeStream:
         self._ws = None
         self._receiver_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
+        self._idle_close_task: asyncio.Task | None = None
         self._closed = False
         self._started = False
         self._last_audio_or_keepalive = time.monotonic()
+        self._last_audio_at = time.monotonic()
         self._final_text = ""
         self._final_translation_text = ""
         self._partial_text = ""
         self._finalize_requested = False
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
 
     async def start(self) -> None:
         if self._started:
             return
 
         api_key = os.environ["SONIOX_API_KEY"]
+        print("Soniox stream start", f"model={SONIOX_MODEL}", f"language={self.transcription_language}")
         self._ws = await websockets.connect(
             SONIOX_WS_URL,
             max_size=2**24,
@@ -74,11 +82,14 @@ class SonioxRealtimeStream:
         await self._ws.send(json.dumps(self._build_start_message(api_key)))
         self._receiver_task = asyncio.create_task(self._receiver_loop())
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        if SONIOX_IDLE_CLOSE_SECONDS > 0:
+            self._idle_close_task = asyncio.create_task(self._idle_close_loop())
         self._started = True
 
     async def add_audio(self, chunk: bytes) -> None:
         if self._closed or self._ws is None or not chunk:
             return
+        self._last_audio_at = time.monotonic()
         self._last_audio_or_keepalive = time.monotonic()
         await self._ws.send(chunk)
 
@@ -94,7 +105,12 @@ class SonioxRealtimeStream:
     async def close(self) -> None:
         if self._closed:
             return
+        print("Soniox stream close", f"language={self.transcription_language}")
         self._closed = True
+        current_task = asyncio.current_task()
+        if self._idle_close_task is not None and self._idle_close_task is not current_task:
+            self._idle_close_task.cancel()
+            await asyncio.gather(self._idle_close_task, return_exceptions=True)
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
             await asyncio.gather(self._keepalive_task, return_exceptions=True)
@@ -151,6 +167,25 @@ class SonioxRealtimeStream:
                     continue
                 await self._ws.send(json.dumps({"type": "keepalive"}))
                 self._last_audio_or_keepalive = time.monotonic()
+        except asyncio.CancelledError:
+            pass
+
+    async def _idle_close_loop(self) -> None:
+        try:
+            idle_s = max(1.0, SONIOX_IDLE_CLOSE_SECONDS)
+            while not self._closed:
+                await asyncio.sleep(min(5.0, idle_s))
+                if self._closed:
+                    return
+                if time.monotonic() - self._last_audio_at < idle_s:
+                    continue
+                print(
+                    "Soniox stream idle close",
+                    f"language={self.transcription_language}",
+                    f"idle_seconds={idle_s:g}",
+                )
+                await self.close()
+                return
         except asyncio.CancelledError:
             pass
 
