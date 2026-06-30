@@ -795,11 +795,12 @@ async def send_transcript_and_translation(
     direct_translation: str = "",
     source: str = "",
     translation_context: list[str] | None = None,
+    segment_id: str = "",
 ):
     transcript = transcript.strip()
     if not transcript:
         return
-    segment_id = make_segment_id()
+    segment_id = segment_id.strip() or make_segment_id()
 
     payload = {
         "type": "transcript_final",
@@ -938,10 +939,12 @@ async def ws_endpoint(ws: WebSocket):
     memory_update_lock = asyncio.Lock()
     assistant_request_lock = asyncio.Lock()
     suggestion_lock = asyncio.Lock()
+    finalize_lock = asyncio.Lock()
     suggestion_task = None
     memory_flush_tasks: set[asyncio.Task] = set()
     last_assistant_reply: list[str] = []
     flush_pending_memory = None
+    full_finalize_requested = False
     transcribe_closed = False
     stt_error_sent = False
 
@@ -1024,15 +1027,14 @@ async def ws_endpoint(ws: WebSocket):
             save_session_state(session_state)
         last_assistant_reply = list(session_state.get("next_actions") or [])
 
-        if not use_soniox_direct_translation:
-            translation_task = asyncio.create_task(
-                translation_worker(
-                    ws,
-                    translation_queue,
-                    transcription_language,
-                    translation_language,
-                )
+        translation_task = asyncio.create_task(
+            translation_worker(
+                ws,
+                translation_queue,
+                transcription_language,
+                translation_language,
             )
+        )
 
         if outline and is_new_session:
             try:
@@ -1194,7 +1196,11 @@ async def ws_endpoint(ws: WebSocket):
                             pending_memory_transcripts[:0] = pending_batch
                             pending_memory_chars += sum(len(str(item.get("text") or "")) for item in pending_batch)
 
-        async def handle_transcript_final(transcript: str, source: str = ""):
+        async def handle_transcript_final(
+            transcript: str,
+            source: str = "",
+            segment_id: str = "",
+        ):
             nonlocal pending_memory_chars
             append_recent_conversation(session_state, transcript, source)
             save_session_state(session_state)
@@ -1217,6 +1223,7 @@ async def ws_endpoint(ws: WebSocket):
                 translation_queue=translation_queue,
                 source=source,
                 translation_context=translation_context,
+                segment_id=segment_id,
             )
 
         async def handle_soniox_final(transcript: str, translation: str, source: str = ""):
@@ -1403,6 +1410,38 @@ async def ws_endpoint(ws: WebSocket):
                 "reason": reason,
             })
 
+        async def finalize_session(
+            reason: str = "",
+            pending_transcript: str = "",
+            pending_segment_id: str = "",
+        ):
+            nonlocal full_finalize_requested
+            async with finalize_lock:
+                is_full_finalize = reason in {"page_exit", "finalize_exit", "exit_finalize"}
+                if is_full_finalize:
+                    full_finalize_requested = True
+
+                pending_transcript = pending_transcript.strip()
+                if pending_transcript:
+                    await handle_transcript_final(
+                        pending_transcript,
+                        "mixed",
+                        pending_segment_id,
+                    )
+
+                if is_full_finalize and suggestion_task is not None:
+                    await asyncio.gather(suggestion_task, return_exceptions=True)
+                if is_full_finalize and memory_flush_tasks:
+                    await asyncio.wait(memory_flush_tasks, timeout=3)
+                if is_full_finalize and flush_pending_memory is not None:
+                    await flush_pending_memory(force=True)
+                if translation_task is not None:
+                    await translation_queue.join()
+                await safe_send_envelope(ws, {
+                    "type": "finalize_complete",
+                    "reason": reason,
+                })
+
         async def handle_client_messages():
             nonlocal suggestion_task
             while True:
@@ -1437,6 +1476,14 @@ async def ws_endpoint(ws: WebSocket):
 
                 if body_type == "reset":
                     await reset_source_transcribers(str(body.get("source") or ""))
+                    continue
+
+                if body_type == "finalize":
+                    await finalize_session(
+                        str(body.get("reason") or ""),
+                        str(body.get("pending_transcript") or ""),
+                        str(body.get("pending_segment_id") or ""),
+                    )
                     continue
 
                 if body_type == "request_suggestion":
@@ -1491,11 +1538,11 @@ async def ws_endpoint(ws: WebSocket):
         if session_registered:
             async with ACTIVE_CLIENT_SESSION_LOCK:
                 ACTIVE_CLIENT_SESSION_IDS.discard(client_session_id)
-        if suggestion_task is not None:
+        if full_finalize_requested and suggestion_task is not None:
             await asyncio.gather(suggestion_task, return_exceptions=True)
-        if memory_flush_tasks:
+        if full_finalize_requested and memory_flush_tasks:
             await asyncio.wait(memory_flush_tasks, timeout=3)
-        if flush_pending_memory is not None:
+        if full_finalize_requested and flush_pending_memory is not None:
             await flush_pending_memory(force=True)
         if translation_task is not None:
             await translation_queue.join()

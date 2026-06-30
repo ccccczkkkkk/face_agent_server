@@ -219,11 +219,12 @@ async def send_transcript_and_translation(
     translation_queue: asyncio.Queue[tuple[str, str, list[str]]] | None = None,
     direct_translation: str = "",
     translation_context: list[str] | None = None,
+    segment_id: str = "",
 ):
     transcript = transcript.strip()
     if not transcript:
         return
-    segment_id = f"seg_{uuid.uuid4().hex[:12]}"
+    segment_id = segment_id.strip() or f"seg_{uuid.uuid4().hex[:12]}"
     sent = await safe_send_envelope(ws, {
         "type": "transcript_final",
         "segment_id": segment_id,
@@ -456,6 +457,8 @@ async def ws_endpoint(ws: WebSocket):
     pending_summary_transcripts: list[str] = []
     pending_summary_chars = 0
     summary_lock = asyncio.Lock()
+    finalize_lock = asyncio.Lock()
+    full_finalize_requested = False
 
     try:
         try:
@@ -534,15 +537,14 @@ async def ws_endpoint(ws: WebSocket):
                 translation_context=translation_context,
             )
 
-        if not use_soniox_direct_translation:
-            translation_task = asyncio.create_task(
-                subtitle_translation_worker(
-                    ws,
-                    translation_queue,
-                    transcription_language,
-                    translation_language,
-                )
+        translation_task = asyncio.create_task(
+            subtitle_translation_worker(
+                ws,
+                translation_queue,
+                transcription_language,
+                translation_language,
             )
+        )
         summary_task = asyncio.create_task(
             subtitle_summary_worker(
                 ws,
@@ -563,6 +565,39 @@ async def ws_endpoint(ws: WebSocket):
                 "message": "transcribe websocket closed",
                 "reason": reason,
             })
+
+        async def finalize_session(
+            reason: str = "",
+            pending_transcript: str = "",
+            pending_segment_id: str = "",
+        ):
+            nonlocal transcriber, transcriber_task, full_finalize_requested
+            async with finalize_lock:
+                is_full_finalize = reason in {"page_exit", "finalize_exit", "exit_finalize"}
+                if is_full_finalize:
+                    full_finalize_requested = True
+
+                pending_transcript = pending_transcript.strip()
+                if pending_transcript:
+                    await send_transcript_and_translation(
+                        ws,
+                        pending_transcript,
+                        handle_summary_transcript,
+                        translation_queue=translation_queue,
+                        translation_context=translation_context,
+                        segment_id=pending_segment_id,
+                    )
+
+                if is_full_finalize:
+                    await flush_pending_summary(force=True)
+                if translation_task is not None:
+                    await translation_queue.join()
+                if is_full_finalize and summary_task is not None:
+                    await summary_queue.join()
+                await safe_send_envelope(ws, {
+                    "type": "finalize_complete",
+                    "reason": reason,
+                })
 
         async def handle_client_messages():
             nonlocal transcriber, transcriber_task
@@ -631,6 +666,14 @@ async def ws_endpoint(ws: WebSocket):
                     elif transcriber is not None:
                         await transcriber.reset()
 
+                if body.get("type") == "finalize":
+                    await finalize_session(
+                        str(body.get("reason") or ""),
+                        str(body.get("pending_transcript") or ""),
+                        str(body.get("pending_segment_id") or ""),
+                    )
+                    continue
+
         if STT_BACKEND == "realtime":
             await asyncio.gather(
                 handle_client_messages(),
@@ -668,10 +711,11 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        if "flush_pending_summary" in locals():
+        if full_finalize_requested and "flush_pending_summary" in locals():
             await flush_pending_summary(force=True)
         if summary_task is not None:
-            await summary_queue.join()
+            if full_finalize_requested:
+                await summary_queue.join()
             summary_task.cancel()
             await asyncio.gather(summary_task, return_exceptions=True)
         if translation_task is not None:
